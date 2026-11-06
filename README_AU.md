@@ -1,47 +1,119 @@
-# TVStreamSource_CN — Australia-tested playlist for my-tv-0
+# 澳洲观看中文电视：家庭网关方案
 
-`au.m3u` is a short playlist of Chinese TV channels (央视 / 卫视 / 港澳台) in which **every URL was tested
-from an Australian connection** (HLS playlist fetched, a real video segment downloaded, speed and load
-time measured, tested twice). Dead, geo-blocked, VOD and slow URLs are dropped, and each channel keeps at
-most 3 URLs, fastest first, so my-tv-0 falls over to a working one quickly.
+在布里斯班用 Fire TV 上的 [mytv-android](https://github.com/yaoxieyoulei/mytv-android) 看央视、卫视和港澳台频道。
 
-Current build (tested from Brisbane): 72 channels / 150 URLs; median time to first video data about
-1.1 s, 90% under 2.4 s, every URL downloaded at least 2x faster than it plays when built. A second,
-independent re-test of the finished file a few minutes later found 148 of 150 still alive and 144 still
-at 1.5x or better. Many of the URLs are community relay servers on bare IP addresses, which can vanish
-without notice, so refresh regularly (see below).
+电视不再直接连网上的公共线路，而是只连家里一台常开服务器上的网关。网关负责选线、换线和缓冲，电视看到的始终是一路稳定的流，播放器 App 不用改。
 
-## Use in my-tv-0
+```
+公共线路（会挂、会冻结、会变成广告）
+    │  竞速选线、锁定跳转、拒绝广告、提前换线
+    ▼
+家庭网关（常开服务器，缓冲约 30 秒）
+    │  局域网
+    ▼
+Fire TV + 原版 mytv-android
+```
 
-Settings → video source → set the address to your raw file URL:
+## 为什么以前不稳定
 
-    https://raw.githubusercontent.com/JerryPeng573/TVStreamSource_CN/main/au.m3u
+以下都是实测结果（2026-11-07，布里斯班，Aussie Broadband）：
 
-If raw.githubusercontent.com is slow on your network, the jsDelivr mirror is an alternative
-(it caches, so updates can lag for a while):
+| 问题 | 实测 | 表现 |
+|---|---|---|
+| **线路会把频道换成购物广告** | 150 条线路里 129 条是跳转，50 条会落到电视购物广告；72 个频道有 43 个受影响，22% 的请求拿到广告 | 频道突然变成广告 |
+| **跳转目标每次都变** | 50 条线路每次请求落到的流不同，而播放器每次刷新列表都重新请求 | 卡顿、跳帧、报错 |
+| **线路老化，没人更新** | 构建 7 天后，已有 48 条连不上（后来发现部分是跳转目标暂时故障），列表只靠手动刷新 | 频道失效 |
+| **冻结线路** | 14 条线路返回正常的 200，但内容不再更新 | 放一会儿就停 |
+| **备用线路并不独立** | 排名靠前的 9 个中转 IP 有 8 个在堪萨斯城同一运营方 | 一挂一片 |
+| **距离远** | 到堪萨斯城约 220ms，中转窗口通常只有 3 段 × 10 秒 | 容错空间小 |
+| **播放器不会因为慢而换线** | 卡住时只重连同一条线路；最后一条失败后不再重试；坏线路最多等 15 秒 | 一直卡、黑屏 |
+| **家里 Wi-Fi 在 2.4 GHz** | 到路由器有约 3% 丢包，周围 7 个以上邻居网络 | 放大上面所有问题 |
 
-    https://cdn.jsdelivr.net/gh/JerryPeng573/TVStreamSource_CN@main/au.m3u
+## 网关做了什么
 
-Also switch on **应用启动后更新视频源** so the app re-downloads the list when it starts.
+- **竞速起播**：同时试 3 条线路，用最先送来真实视频的一条，首个分片边下边播。
+- **锁定跳转**：跳转器每次都重新分配，网关拿到真实地址后就固定读它，令牌过期才重新解析。
+- **拒绝广告**：内置已知广告流，并自动发现「多个频道指向同一个流」的情况。
+- **提前换线**：线路断开、冻结、变慢时，在缓冲耗尽前换到下一条，从同一进度接上。
+- **绝不报错**：所有线路都挂时显示「无信号」画面，线路恢复后自动继续。播放器遇到错误会停住，这样它就不会停。
+- **健康记录**：记住每条线路的表现，下次优先用表现好的。只拉取正在观看的频道。
 
-## Keep it fresh (important)
+## 实测效果
 
-IPTV URLs rot within days to weeks. Re-run the tester every week or two, ideally on a PC on the
-same internet connection as the TV:
+2026-11-07 上午在布里斯班测得，同一时间、同一网络，线路来自旧列表和新线路库：
 
-    pip install requests
-    python tools/build_playlist.py
+| | 直连旧列表 | 走网关 |
+|---|---|---|
+| 换台到出画面（30 个频道，中位数） | 5.4 秒 | 2.8 秒 |
+| 显示购物广告 | 12 个频道 | 0 |
+| 连续播放 10 分钟（2 个频道） | 4 次卡顿，共 48 秒，两路都断流 | 0 次卡顿 |
 
-It downloads ~10 public lists, tests every stream from your location, and rewrites `au.m3u`.
-Then commit and push `au.m3u`.
+测试规模不大，用的是模拟播放器，网关跑在 PC 上，时段也不是晚高峰。另外用 hls.js 真实解码验证了一次强制换线：0 丢帧、0 错误。在 Fire TV 上的真实表现还需要实际观看确认。
 
-Useful options: `--max-uris 3` (URLs per channel), `--min-realtime 2.0` (reject streams that download less than 2x faster than they play),
-`--max-load-ms 4000` (reject slow-to-start streams), `--report report.json` (per-URL timings).
+## 部署
 
-## Why the old list was slow and unreliable
+需要一台常开的 Linux 机器，只要 Python 3.9 以上，不用装任何依赖。
 
-* `tv/m3u/index.m3u` (from fanmingming/live) is mostly Guangdong Unicom IPTV URLs with an expired
-  account token (`Authinfo=...&mac=...`) and China-only CDNs: from Australia ~2 of 94 worked.
-* `tv/m3u/ipv6.m3u` needs IPv6 routes into China Mobile's network: 12 of 82 worked.
-* my-tv-0 retries each URL up to 10 times (cycling player types) before trying the next URL for the
-  same channel, so a dead first URL costs a long wait. Keeping only live URLs removes that wait.
+把仓库放到服务器上，然后运行：
+
+```bash
+sh gateway/install.sh
+```
+
+它会安装两样东西：常驻服务 `iptv-gateway`（端口 8088），以及每天凌晨 3:30 刷新线路的定时任务 `iptv-lines`。卸载用 `sh gateway/install.sh --remove`。
+
+## 电视上的设置
+
+mytv-android 打开时，在同一网络的电脑或手机上访问 `http://<电视IP>:10481`，把订阅源改成：
+
+```
+http://192.168.1.120:8088/tv.m3u
+```
+
+保存后重启 App。这个地址里的频道地址是固定的，以后线路更新都在服务器上完成，电视不用再改。
+
+服务器的 IP 要固定，建议在路由器里做 DHCP 地址保留。
+
+## 检查和排错
+
+| 地址 | 用途 |
+|---|---|
+| `http://192.168.1.120:8088/` | 频道列表和网页播放器，任何设备都能打开 |
+| `http://192.168.1.120:8088/status` | 每个频道在用哪条线路、缓冲多少秒、换过几次 |
+| `http://192.168.1.120:8088/switch/<频道>` | 手动换线，比如画面内容不对时 |
+
+如果画面又出现了广告，说明对方换了新的广告流。把它的路径加到 `gateway/iptv_gateway.py` 的 `KNOWN_DECOYS`，或者等第二天的定时刷新自动发现。
+
+## 没有网关时的备用方案
+
+`au.m3u` 是直连线路，只保留没有跳到广告、也不会乱跳的线路，可以直接在任何播放器里订阅：
+
+```
+https://raw.githubusercontent.com/JerryPeng573/TVStreamSource_CN/main/au.m3u
+```
+
+它不会自动更新，也没有网关的换线能力，只建议在服务器出问题时临时使用。
+
+## 手动刷新线路
+
+```bash
+python tools/build_playlist.py
+```
+
+大约 20 分钟。检查项：用播放器的 UA 访问、内容有更新、多次请求都落到真实频道、解码格式可用、下载快于实时。
+
+## 开发
+
+```bash
+python gateway/test_gateway.py
+```
+
+测试用假的上游服务器制造真实的故障（断开、冻结、变慢、跳到广告、令牌过期），再用模拟播放器验证观众看到的结果。
+
+`tools/compare.py` 用真实线路对比直连和网关，`tools/hlssim.py` 是其中的模拟播放器。
+
+## 局限
+
+- 公共线路本身没有保障。网关能遮住单条线路的故障，但遮不住某个频道的所有线路同时失效，这时会显示「无信号」。
+- 部分频道的线路集中在同一运营方，这个运营方出问题时这些频道会一起受影响。
+- 线路来自公开的社区列表，内容的版权归属需要自行判断。

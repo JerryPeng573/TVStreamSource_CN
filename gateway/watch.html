@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>家庭电视网关</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f6f6f4; --fg: #1c1c1a; --muted: #6a6a64; --line: #d9d9d3; --accent: #0b6bcb; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161615; --fg: #ececE8; --muted: #9a9a92; --line: #333330; --accent: #6db0f2; } }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+  video { width: 100%; max-width: 900px; background: #000; display: block; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  h2 { font-size: 14px; margin: 16px 0 6px; color: var(--muted); font-weight: 600; }
+  a { color: var(--accent); text-decoration: none; margin-right: 12px; display: inline-block; padding: 2px 0; }
+  pre { font-size: 12px; color: var(--muted); white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+<h1 id="title">家庭电视网关</h1>
+<video id="v" controls autoplay muted playsinline hidden></video>
+<pre id="state"></pre>
+<div id="list"></div>
+<script src="/hls.min.js"></script>
+<script>
+const ch = new URLSearchParams(location.search).get('ch');
+const video = document.getElementById('v');
+const state = document.getElementById('state');
+const events = {errors: 0, fatal: 0, levelsSwitched: 0, stalls: 0, frags: 0, discontinuities: 0};
+window.playerEvents = events;
+
+async function channelList() {
+  const text = await (await fetch('/tv.m3u')).text();
+  const groups = {};
+  for (const m of text.matchAll(/tvg-id="([^"]+)".*?group-title="([^"]+)",(.*)/g)) {
+    (groups[m[2]] = groups[m[2]] || []).push([m[1], m[3]]);
+  }
+  const list = document.getElementById('list');
+  for (const g in groups) {
+    const h = document.createElement('h2');
+    h.textContent = g;
+    list.append(h);
+    for (const [id, name] of groups[g]) {
+      const a = document.createElement('a');
+      a.href = '?ch=' + encodeURIComponent(id);
+      a.textContent = name;
+      list.append(a);
+    }
+  }
+}
+
+function play() {
+  video.hidden = false;
+  document.getElementById('title').textContent = ch;
+  const hls = new Hls({maxBufferLength: 60});
+  hls.on(Hls.Events.ERROR, (_, d) => {
+    events.errors++;
+    if (d.fatal) events.fatal++;
+    if (d.details === 'bufferStalledError') events.stalls++;
+    events.lastError = d.details;
+  });
+  hls.on(Hls.Events.FRAG_CHANGED, (_, d) => {
+    events.frags++;
+    if (d.frag && d.frag.tagList && d.frag.tagList.some(t => t[0] === 'EXT-X-DISCONTINUITY' || t[0] === 'DIS')) events.discontinuities++;
+  });
+  hls.loadSource('/live/' + encodeURIComponent(ch) + '.m3u8');
+  hls.attachMedia(video);
+  video.play().catch(() => {});
+  setInterval(async () => {
+    const s = await (await fetch('/status')).json();
+    const quality = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : {};
+    events.time = video.currentTime;
+    events.width = video.videoWidth;
+    events.decoded = quality.totalVideoFrames;
+    events.dropped = quality.droppedVideoFrames;
+    state.textContent = JSON.stringify({player: events, sessions: s.sessions}, null, 1);
+  }, 2000);
+}
+
+channelList();
+if (ch) play();
+</script>
+</body>
+</html>
