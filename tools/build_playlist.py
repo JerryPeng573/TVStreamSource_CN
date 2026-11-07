@@ -33,6 +33,7 @@ import json
 import re
 import socket
 import sys
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -43,7 +44,7 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "gateway"))
 from iptv_gateway import (KNOWN_DECOYS, Fetcher, Line, LineError, looks_like_ts, pick_variant,  # noqa: E402
-                          stream_keys)
+                          segment_id, stream_keys)
 
 EPG = "https://live.fanmingming.cn/e.xml"
 LOGO = "https://live.fanmingming.cn/tv/{}.png"
@@ -162,8 +163,25 @@ def ts_video(data):
 
 
 # ---------------------------------------------------------------- probing
+PER_HOST = 3  # one redirector can front dozens of candidates, and answers a burst by refusing it
+host_slots = {}
+host_slots_lock = threading.Lock()
+
+
+def host_slot(url):
+    """Limits how many tests hit one server at once, so a busy server is not mistaken for a dead line."""
+    host = urlsplit(url).hostname
+    with host_slots_lock:
+        return host_slots.setdefault(host, threading.BoundedSemaphore(PER_HOST))
+
+
 def quick(url):
     """Stage 1: does it answer the player with a live playlist and real video?"""
+    with host_slot(url):
+        return first_look(url)
+
+
+def first_look(url):
     line = Line(url)
     try:
         t0 = time.monotonic()
@@ -192,7 +210,9 @@ def moving(url, first):
     line = Line(url)
     try:
         for _ in range(3):
-            if line.load(6.0).segs[-1][2] != first["edge"]:
+            with host_slot(url):
+                edge = line.load(6.0).segs[-1][2]
+            if segment_id(edge) != segment_id(first["edge"]):
                 return True
             time.sleep(max(first["target"] / 2, 1))
         return False
@@ -209,11 +229,12 @@ def rolls(url, n=6):
     try:
         for _ in range(n):
             try:
-                status, body, final, _ = fetch.get(url, 6.0, 2_000_000)
-                if status == 200 and b"#EXT-X-STREAM-INF" in body:
-                    variant = pick_variant(body.decode("utf-8", "replace"), final)
-                    if variant:
-                        status, _, final, _ = fetch.get(variant, 6.0, 2_000_000)
+                with host_slot(url):
+                    status, body, final, _ = fetch.get(url, 6.0, 2_000_000)
+                    if status == 200 and b"#EXT-X-STREAM-INF" in body:
+                        variant = pick_variant(body.decode("utf-8", "replace"), final)
+                        if variant:
+                            status, _, final, _ = fetch.get(variant, 6.0, 2_000_000)
                 if status == 200:
                     finals.append(final)
             except LineError:
@@ -436,6 +457,16 @@ def main():
                 break
     print(f"  {len(chosen)} to speed test", flush=True)
     speeds = dict(zip([i["url"] for i in chosen], pmap(speed, [i["url"] for i in chosen], 6)))
+
+    def too_slow(url):
+        return not speeds[url] or speeds[url]["rt"] < a.min_realtime
+
+    # Six downloads at once share the home link, so a miss may be the test and not the line.
+    again = [i["url"] for i in chosen if too_slow(i["url"])]
+    print(f"  {len(again)} missed the speed bar; testing those again, two at a time...", flush=True)
+    for url, result in zip(again, pmap(speed, again, 2)):
+        if result and (not speeds[url] or result["rt"] > speeds[url]["rt"]):
+            speeds[url] = result
     nets = networks([i["url"] for i in chosen])
 
     chans = {}
@@ -461,6 +492,7 @@ def main():
             lines = spread(chans[k], a.max_lines)
             independent += len({c["net"] for c in lines}) >= 2
             entry["lines"] = [c["url"] for c in lines]
+            entry["networks"] = len({c["net"] for c in lines})
             # A player rereads the URL at every refresh, so a line that wanders between servers only
             # works through the gateway, which pins it.
             for c in [c for c in lines if not c["wanders"]][:a.max_uris]:
@@ -469,12 +501,18 @@ def main():
             report.append({"channel": title, "group": grp, "lines": lines})
         else:
             # Nothing passed today. Keep the channel for a while: the gateway keeps trying its lines.
+            funnel = [sum(1 for i in rows if i["cls"] == k) for rows in (items, live, chosen)]
+            fast = sum(1 for i in chosen if i["cls"] == k and not too_slow(i["url"]))
+            print(f"  no line for {tvg}: {funnel[0]} candidates, {funnel[1]} leading to the channel, "
+                  f"{funnel[2]} speed tested, {fast} fast enough", flush=True)
             old = prev[tvg]
             since = old.get("failing_since", today)
             age = (datetime.strptime(today, "%Y-%m-%d") - datetime.strptime(since, "%Y-%m-%d")).days
             if age > 14:
                 continue
             entry.update(lines=old["lines"], failing_since=since)
+            if "networks" in old:
+                entry["networks"] = old["networks"]
             kept += 1
         channels.append(entry)
 
@@ -489,6 +527,18 @@ def main():
     print(f"wrote {a.lines}\nwrote {a.out}")
     if a.report:
         Path(a.report).write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+    if a.health:  # the dashboard reads each night's result from beside the gateway's health data
+        summary = {"t": int(time.time()), "minutes": round((time.time() - t0) / 60, 1), "candidates": len(items),
+                   "alive": len(alive), "moving": sum(1 for u in alive if moved.get(u)),
+                   "honest": len(live), "speed_tested": len(chosen), "channels_ok": len(chans),
+                   "channels": len(channels), "multi_network": independent, "kept": kept,
+                   "lines": sum(len(c["lines"]) for c in channels), "new_decoys": len(new_decoys),
+                   "failing": [c["id"] for c in channels if c.get("failing_since")]}
+        try:
+            with open(Path(a.health).with_name("refresh.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+        except OSError as e:
+            print(f"  ! cannot record this run: {e}")
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ Only channels being watched are pulled. Python standard library only.
     GET /status                what each session is doing
     GET /switch/<channel>      leave the current line for another one
     GET /                      channel list and a browser player, for checking from any device
+    GET /dash                  dashboard: what is playing, how it has gone, every channel's lines
 """
 import argparse
 import http.client
@@ -43,12 +44,13 @@ import queue
 import random
 import socket
 import ssl
+import subprocess
 import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, unquote, urljoin, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 log = logging.getLogger("gateway")
 HLS_JS = Path(__file__).resolve().parent.parent / "player" / "hls.min.js"
@@ -61,7 +63,7 @@ START_MEDIA = 4.0  # seconds of media to hold before answering the first playlis
 FIRST_WAIT = 11.0  # the player gives up at 15 s, so show the slate before that
 RACE_WIDTH = 3  # lines tried at once
 RACE_DEADLINE = 7.0
-RACE_GRACE = 0.35  # after the first winner, wait this long for a faster one
+RACE_GRACE = 0.6  # after the first winner, wait this long for a faster one
 VALIDATE_BYTES = 64_000  # this much real MPEG-TS proves a line works
 MAX_BPS = 12_000_000  # ignore variants above this; the home link cannot carry them reliably
 CONNECT_TIMEOUT = 3.0
@@ -71,11 +73,12 @@ PLAYLIST_SECS = 60.0  # media listed in the playlist
 MAX_SESSIONS = 3
 IDLE_SECS = 20.0  # stop pulling a channel this long after the last request
 SLOW_RT = 1.2  # below this realtime factor a line is not keeping up
+TOKEN_PARAMS = {"u", "t", "k", "e", "st", "token", "sign", "auth", "key", "expire", "expires",
+                "wssecret", "wstime", "jsbt", "jsbk"}  # change with a new token, not a new segment
 COOLDOWN_SECS = 180.0  # a line that failed is not tried again for this long, unless nothing else works
 TICK = 0.2
 MONITOR_GAP = 25.0  # seconds between background line checks
 MONITOR_BYTES = 300_000  # sample this much of a segment, enough to see speed without wasting data
-TYPICAL_BPS = 3_300_000  # median bitrate measured across the lines; turns a speed into a realtime factor
 SYNC = 0x47
 
 
@@ -254,6 +257,13 @@ def pick_variant(text, base):
     return max(under or [min(variants)], key=lambda v: v[0])[1]
 
 
+def segment_id(uri):
+    """A segment's identity. Relays sign segment URLs, so a new token makes the same segment look new."""
+    u = urlsplit(uri)
+    kept = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True) if k.lower() not in TOKEN_PARAMS]
+    return urlunsplit(("", "", u.path, urlencode(kept), ""))
+
+
 def looks_like_ts(data):
     if len(data) < 188 * 3:
         return False
@@ -343,20 +353,23 @@ class Line:
     def new_segments(self, pl):
         """Segments not yet taken. Returns (segments, restarted)."""
         restarted = False
-        if self.relocated:  # join the new server near its edge, and tell the player
+        if self.relocated:
             self.relocated = False
-            self.seen.clear()
-            self.uri_mode = False
-            self.last_seq = pl.segs[max(0, len(pl.segs) - 3)][0] - 1
-            return [s for s in pl.segs if s[0] > self.last_seq], True
+            edge = pl.segs[-1]
+            near = pl.has_seq and not self.uri_mode and self.last_seq - 5 <= edge[0] <= self.last_seq + 60
+            if not near:  # really another stream: take its newest segment and tell the player
+                self.seen.clear()
+                self.uri_mode = not pl.has_seq
+                self.last_seq = edge[0] - 1
+                return [edge], True
         if self.last_seq is not None and not self.uri_mode:
             edge = pl.segs[-1]
-            # no usable sequence numbers, or the sequence does not move while the URIs do
-            if not pl.has_seq or (edge[0] == self.last_seq and edge[2] != self.last_uri
-                                  and edge[2] not in self.seen):
+            # no usable sequence numbers, or the sequence does not move while the segments do
+            if not pl.has_seq or (edge[0] == self.last_seq and segment_id(edge[2]) != self.last_uri
+                                  and segment_id(edge[2]) not in self.seen):
                 self.uri_mode = True
         if self.uri_mode:
-            new = [s for s in pl.segs if s[2] not in self.seen]
+            new = [s for s in pl.segs if segment_id(s[2]) not in self.seen]
         else:
             if pl.segs[-1][0] < self.last_seq - 2:  # upstream restarted its numbering
                 self.last_seq, restarted = pl.seq - 1, True
@@ -364,8 +377,8 @@ class Line:
         return new, restarted
 
     def mark(self, seg):
-        self.last_seq, self.last_uri = seg[0], seg[2]
-        self.seen.append(seg[2])
+        self.last_seq, self.last_uri = seg[0], segment_id(seg[2])
+        self.seen.append(self.last_uri)
         self.last_new = time.monotonic()
 
 
@@ -401,6 +414,9 @@ class Health:
                 h["rt"] = round(h["rt"] * 0.7 + min(rt, 20.0) * 0.3, 2) if h["rt"] else round(min(rt, 20.0), 2)
             self.dirty += 1
 
+    def rt(self, url):
+        return self.data.get(url, {}).get("rt", 0.0)
+
     def score(self, url):
         h = self.data.get(url)
         if not h:
@@ -424,6 +440,59 @@ class Health:
             log.error("cannot save health data: %s", e)
 
 
+# ---- events -----------------------------------------------------------------------------------
+class Events:
+    """What happened, one JSON object per line, for the dashboard. Kept for KEEP_DAYS."""
+
+    KEEP_DAYS = 30
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+
+    def add(self, kind, **fields):
+        if not self.path:
+            return
+        line = json.dumps({"t": int(time.time()), "kind": kind, **fields}, ensure_ascii=False)
+        with self.lock:
+            try:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except OSError as e:
+                log.error("cannot record event: %s", e)
+
+    def read(self, since=0):
+        if not self.path or not self.path.exists():
+            return []
+        out = []
+        with self.lock:
+            try:
+                lines = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                return []
+        for line in lines:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("t", 0) >= since:
+                out.append(e)
+        return out
+
+    def prune(self):
+        keep = self.read(time.time() - self.KEEP_DAYS * 86400)
+        if not self.path:
+            return
+        text = "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in keep)
+        with self.lock:
+            tmp = self.path.with_suffix(".tmp")
+            try:
+                tmp.write_text(text, encoding="utf-8")
+                tmp.replace(self.path)
+            except OSError as e:
+                log.error("cannot prune events: %s", e)
+
+
 # ---- racing -----------------------------------------------------------------------------------
 class Racer(threading.Thread):
     """Opens one line and downloads one real segment. The segment fills in as it arrives, so the
@@ -438,13 +507,22 @@ class Racer(threading.Thread):
         self.pl = self.info = None
         self.seg = Seg(0.0, bytearray(), done=False)
         self.announced = False
+        self.first_byte = None
         self.rt = 0.0
         self.failed = False
 
     def cancelled(self):
         return self.lost.is_set() or self.stop_session()
 
+    def rate(self):
+        """Bytes a second since the segment started arriving."""
+        if self.first_byte is None:
+            return 0.0
+        return len(self.seg.data) / max(time.monotonic() - self.first_byte, 0.05)
+
     def _feed(self, chunk):
+        if self.first_byte is None:
+            self.first_byte = time.monotonic()
         with self.cond:
             self.seg.data += chunk
             self.cond.notify_all()
@@ -521,7 +599,8 @@ def race(urls, behind, health, cond, stop):
         for r in racers:
             r.lost.set()
         return None
-    best = max(winners, key=lambda r: len(r.seg.data))  # they all started together
+    # A burst is not a sustained speed, so a line's record counts as well as its first moments.
+    best = max(winners, key=lambda r: r.rate() * (0.5 + min(health.rt(r.url), 4.0) / 4))
     for r in racers:
         if r is not best:
             r.lost.set()
@@ -557,6 +636,14 @@ class Session:
         self.need_disc = False
         self.behind = BUFFER_SECS
         self.leave = False  # set by /switch: drop this line at the next chance
+        self.tuned = False
+        self.last_no_line = 0.0
+        # What the player has fetched. It cannot have played more than that, so whenever the time
+        # since its first fetch exceeds the media fetched, it has been stalled at least that long.
+        self.client_t0 = None
+        self.client_media = 0.0
+        self.client_seen = set()
+        self.first_play = None
         self.stats = {"switches": 0, "slate_secs": 0.0, "history": []}
         threading.Thread(target=self._puller, daemon=True, name=f"pull-{channel['id']}").start()
         threading.Thread(target=self._clock, daemon=True, name=f"clock-{channel['id']}").start()
@@ -565,9 +652,29 @@ class Session:
         self.last_seen = time.monotonic()
 
     def stop(self):
+        if not self.stopped and self.client_t0 is not None:
+            self.gw.events.add("session", channel=self.channel["id"], secs=int(max(0, self.last_seen - self.client_t0)),
+                               switches=self.stats["switches"], slate_secs=round(self.stats["slate_secs"], 1),
+                               stall_secs=round(self.viewer_stall(), 1), first_play=self.first_play)
         self.stopped = True
         with self.cond:
             self.cond.notify_all()
+
+    def viewer_stall(self):
+        """Seconds the player has been without video at least: a lower bound, never a guess upward."""
+        if self.client_t0 is None:
+            return 0.0
+        # Count only until the player last asked for something: after that it has left, not stalled.
+        return max(0.0, self.last_seen - self.client_t0 - self.client_media)
+
+    def _served(self, seg):
+        if seg.n in self.client_seen:
+            return
+        self.client_seen.add(seg.n)
+        if self.client_t0 is None:
+            self.client_t0 = time.monotonic()
+            self.first_play = round(self.client_t0 - self.created, 1)
+        self.client_media += seg.dur
 
     # -- line choice
     def _candidates(self):
@@ -591,11 +698,20 @@ class Session:
                     if self.stopped:
                         return None
             log.warning("%s: no line answered, retrying", self.channel["id"])
+            if time.monotonic() - self.last_no_line > 60:
+                self.last_no_line = time.monotonic()
+                self.gw.events.add("no_line", channel=self.channel["id"])
             for _ in range(int(3 / TICK)):
                 if self.stopped:
                     return None
                 time.sleep(TICK)
         return None
+
+    def _healthy_spare(self, current):
+        """Is there another line worth leaving for? Without one, a slow line beats the slate."""
+        now = time.monotonic()
+        return any(u != current and self.cool.get(u, 0) <= now and self.gw.health.data.get(u, {}).get("ok", 0) >= 0.5
+                   for u in self.channel["lines"])
 
     def _switch(self, why):
         line = self.line
@@ -605,6 +721,8 @@ class Session:
         log.info("%s: leaving %s (%s), %.1fs cushion", self.channel["id"], line.url, why, self.cushion())
         self.cool[line.url] = time.monotonic() + COOLDOWN_SECS
         self.gw.health.note(line.url, False, why=why)
+        self.gw.events.add("switch", channel=self.channel["id"], line=line.url, why=why,
+                           cushion=round(self.cushion(), 1))
         line.fetch.close()
         # Pick the broadcast up where this line left it, so the buffer refills and nothing is skipped.
         self.behind = min(BUFFER_SECS, self.behind + (time.monotonic() - line.last_new))
@@ -643,8 +761,19 @@ class Session:
                     self.line.mark(won.info)
                     for s in won.pl.segs:  # with no sequence numbers, older URIs must count as seen
                         if s[0] <= won.info[0]:
-                            self.line.seen.append(s[2])
+                            self.line.seen.append(segment_id(s[2]))
                     log.info("%s: on %s (rt %.1f)", self.channel["id"], self.line.url, won.rt)
+                    if not self.tuned:
+                        self.tuned = True
+                        self.gw.events.add("tune", channel=self.channel["id"], line=self.line.url,
+                                           rt=round(won.rt, 2), secs=round(time.monotonic() - self.created, 1))
+                    # A line that cannot deliver its first segment in real time will stall the
+                    # viewer, however good its first moments looked.
+                    if 0 < won.rt < 1.0 and self._healthy_spare(won.url):
+                        dur = won.info[1]
+                        self.behind = max(BUFFER_SECS - dur, 0) + dur / won.rt
+                        self._switch(f"slow start (rt {won.rt:.2f})")
+                        continue
                 try:
                     self._follow()
                 except LineError as e:
@@ -810,6 +939,7 @@ class Session:
         with self.cond:
             for s in reversed(self.published):
                 if s.n == n:
+                    self._served(s)
                     return s
                 if s.n < n:
                     break
@@ -831,6 +961,7 @@ class Session:
                 "cushion_secs": round(self.cushion(), 1),
                 "published": segs, "age_secs": int(time.monotonic() - self.created),
                 "switches": self.stats["switches"], "slate_secs": round(self.stats["slate_secs"], 1),
+                "viewer_stall_secs": round(self.viewer_stall(), 1),
                 "history": self.stats["history"][-5:]}
 
 
@@ -840,6 +971,7 @@ class Gateway:
         self.lines_path = Path(lines_path)
         self.lines_mtime = 0
         self.channels, self.order, self.epg = {}, [], ""
+        self.lines_generated = None
         self.sessions = {}
         self.lock = threading.Lock()
         self.closed = threading.Event()
@@ -847,6 +979,11 @@ class Gateway:
         if state_dir:
             state_dir.mkdir(parents=True, exist_ok=True)
         self.health = Health(state_dir / "health.json" if state_dir else None)
+        self.events = Events(state_dir / "events.jsonl" if state_dir else None)
+        self.refresh_path = state_dir / "refresh.jsonl" if state_dir else None
+        self.started = time.monotonic()
+        self.wifi_cache = (0.0, None)
+        self.last_prune = 0.0
         self.slate, self.slate_dur = None, 1.2
         if slate_path and Path(slate_path).exists():
             self.slate = Path(slate_path).read_bytes()
@@ -867,6 +1004,7 @@ class Gateway:
         self.order = [c for c in doc["channels"] if c.get("lines")]
         self.channels = {c["id"]: c for c in self.order}
         self.epg = doc.get("epg", "")
+        self.lines_generated = doc.get("generated")
         self.lines_mtime = mtime
         log.info("loaded %d channels", len(self.order))
 
@@ -911,6 +1049,9 @@ class Gateway:
                         del self.sessions[cid]
             self.reload()
             self.health.save()
+            if time.time() - self.last_prune > 86400:
+                self.last_prune = time.time()
+                self.events.prune()
 
     def m3u(self, host):
         head = f'#EXTM3U x-tvg-url="{self.epg}"' if self.epg else "#EXTM3U"
@@ -920,6 +1061,109 @@ class Gateway:
             out.append(f'#EXTINF:-1 tvg-id="{c["id"]}" tvg-name="{c["id"]}"{logo} group-title="{c["group"]}",{c["name"]}')
             out.append(f"http://{host}/live/{quote(c['id'], safe='')}.m3u8")
         return "\n".join(out) + "\n"
+
+    # -- dashboard data
+    def wifi(self):
+        """Wi-Fi link of this machine, from `iw`. None where that is not available (Windows, wired)."""
+        at, value = self.wifi_cache
+        if time.monotonic() - at < 30:
+            return value
+        value = None
+        try:
+            dev = subprocess.run(["iw", "dev"], capture_output=True, text=True, timeout=3).stdout
+            name = next((l.split()[1] for l in dev.splitlines() if l.strip().startswith("Interface")), None)
+            if name:
+                link = subprocess.run(["iw", "dev", name, "link"], capture_output=True, text=True, timeout=3).stdout
+                value = {"interface": name}
+                for line in link.splitlines():
+                    k, _, v = line.strip().partition(":")
+                    if k in ("SSID", "freq", "signal", "rx bitrate", "tx bitrate"):
+                        value[k.replace(" ", "_")] = v.strip()
+        except (OSError, subprocess.SubprocessError):
+            value = None
+        self.wifi_cache = (time.monotonic(), value)
+        return value
+
+    def memory_mb(self):
+        try:
+            for line in open("/proc/self/status", encoding="ascii"):
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024)
+        except OSError:
+            return None
+        return None
+
+    def refreshes(self, limit=30):
+        if not self.refresh_path or not self.refresh_path.exists():
+            return []
+        out = []
+        for line in self.refresh_path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]:
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                pass
+        return out
+
+    def now(self):
+        h = self.health.data
+        last = self.refreshes(1)
+        return {"time": int(time.time()), "uptime_secs": int(time.monotonic() - self.started),
+                "memory_mb": self.memory_mb(), "wifi": self.wifi(),
+                "channels": len(self.order), "lines": sum(len(c["lines"]) for c in self.order),
+                "lines_healthy": sum(1 for c in self.order for u in c["lines"] if h.get(u, {}).get("ok", 0) >= 0.5),
+                "lines_generated": self.lines_generated, "last_refresh": last[-1] if last else None,
+                "sessions": [s.describe() for s in list(self.sessions.values())]}
+
+    def history(self, days=14):
+        days = max(1, min(int(days), Events.KEEP_DAYS))
+        start = time.time() - days * 86400
+        events = self.events.read(start)
+        by_day = {}
+        for i in range(days - 1, -1, -1):
+            day = time.strftime("%Y-%m-%d", time.localtime(time.time() - i * 86400))
+            by_day[day] = {"day": day, "tunes": 0, "switches": 0, "evening_switches": 0, "no_line": 0,
+                           "watch_min": 0.0, "stall_secs": 0.0, "slate_secs": 0.0}
+        for e in events:
+            lt = time.localtime(e["t"])
+            d = by_day.get(time.strftime("%Y-%m-%d", lt))
+            if d is None:
+                continue
+            kind = e.get("kind")
+            if kind == "tune":
+                d["tunes"] += 1
+            elif kind == "switch":
+                d["switches"] += 1
+                d["evening_switches"] += 18 <= lt.tm_hour < 23
+            elif kind == "no_line":
+                d["no_line"] += 1
+            elif kind == "session":
+                d["watch_min"] += e.get("secs", 0) / 60
+                d["stall_secs"] += e.get("stall_secs", 0)
+                d["slate_secs"] += e.get("slate_secs", 0)
+        for d in by_day.values():
+            d["watch_min"] = round(d["watch_min"])
+            d["stall_secs"] = round(d["stall_secs"], 1)
+            d["slate_secs"] = round(d["slate_secs"], 1)
+        names = {c["id"]: c["name"] for c in self.order}
+        notable = [e for e in events if e.get("kind") in ("switch", "no_line")
+                   or (e.get("kind") == "session" and (e.get("stall_secs", 0) >= 1 or e.get("slate_secs", 0) > 0))]
+        for e in notable:
+            e["name"] = names.get(e.get("channel"), e.get("channel"))
+        return {"days": list(by_day.values()), "recent": notable[-60:][::-1], "refreshes": self.refreshes()}
+
+    def channel_table(self):
+        h = self.health.data
+        trouble = {}
+        for e in self.events.read(time.time() - 7 * 86400):
+            if e.get("kind") in ("switch", "no_line") or (e.get("kind") == "session" and e.get("stall_secs", 0) >= 1):
+                trouble[e.get("channel")] = max(trouble.get(e.get("channel"), 0), e["t"])
+        rows = []
+        for c in self.order:
+            rows.append({"id": c["id"], "name": c["name"], "group": c["group"], "lines": len(c["lines"]),
+                         "healthy": sum(1 for u in c["lines"] if h.get(u, {}).get("ok", 0) >= 0.5),
+                         "networks": c.get("networks"), "failing_since": c.get("failing_since"),
+                         "last_trouble": trouble.get(c["id"])})
+        return rows
 
     def status(self):
         h = self.health.data
@@ -956,14 +1200,12 @@ class Monitor(threading.Thread):
             if pl.segs[-1][2] == first_edge:
                 raise LineError("stale playlist")
             seg = pl.segs[max(0, len(pl.segs) - 3)]
-            t0 = time.monotonic()
             status, data, _, _ = line.fetch.get(seg[2], 12.0, sample_bytes=MONITOR_BYTES)
             if status != 200:
                 raise LineError(f"segment http {status}")
             if not looks_like_ts(data):
                 raise LineError("segment is not MPEG-TS")
-            rate = len(data) * 8 / max(time.monotonic() - t0, 0.01)
-            self.gw.health.note(url, True, rt=rate / TYPICAL_BPS, weight=0.15)
+            self.gw.health.note(url, True, weight=0.15)
         except LineError as e:
             self.gw.health.note(url, False, why=str(e), weight=0.15)
         except Exception as e:
@@ -1023,6 +1265,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, Path(__file__).with_name("watch.html").read_bytes(), "text/html; charset=utf-8")
         if path == "/hls.min.js":
             return self._send(200, HLS_JS.read_bytes(), "text/javascript", "max-age=86400")
+        if path == "/dash":
+            return self._send(200, Path(__file__).with_name("dash.html").read_bytes(), "text/html; charset=utf-8")
+        if path.startswith("/api/"):
+            query = dict(parse_qsl(urlsplit(self.path).query))
+            if path == "/api/now":
+                data = gw.now()
+            elif path == "/api/history":
+                data = gw.history(query.get("days", "14") if query.get("days", "14").isdigit() else 14)
+            elif path == "/api/channels":
+                data = gw.channel_table()
+            else:
+                return self._send(404, b"not found\n", "text/plain")
+            return self._send(200, json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
         if path == "/status":
             return self._send(200, json.dumps(gw.status(), ensure_ascii=False, indent=1).encode("utf-8"),
                               "application/json; charset=utf-8")

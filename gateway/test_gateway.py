@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 import urllib.request
+from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -40,6 +41,8 @@ class Origin:
         self.requests = {"playlist": 0, "segment": 0}
         self.rolls = 0
         self.destinations = ["/live.m3u8"]
+        self.token = None  # segment URLs carry this, as relays sign theirs
+        self.served = []
         self.user_agents = set()
         origin = self
 
@@ -72,6 +75,7 @@ class Origin:
                     ctype = "application/vnd.apple.mpegurl"
                 elif "/s" in path and path.endswith(".ts"):
                     origin.requests["segment"] += 1
+                    origin.served.append(path)
                     if origin.seg404:
                         return self._reply(404, b"", "text/plain")
                     if origin.garbage:
@@ -124,8 +128,9 @@ class Origin:
         out = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{int(self.target + 0.999)}"]
         if self.media_sequence:
             out.append(f"#EXT-X-MEDIA-SEQUENCE:{first}")
+        tail = f"?u=1.2.3.4&t={self.token}&k=abc{self.token}" if self.token else ""
         for n in range(first, edge + 1):
-            out += [f"#EXTINF:{self.target:.3f},", f"s{n}.ts"]
+            out += [f"#EXTINF:{self.target:.3f},", f"s{n}.ts{tail}"]
         return "\n".join(out) + "\n"
 
     def close(self):
@@ -413,7 +418,187 @@ class Redirects(Harness):
         self.assertFalse(gw.is_decoy("http://x:1/other.m3u8"))
 
 
+class Tokens(Harness):
+    """Relays sign segment URLs, so a new token must not make segments already held look new."""
+
+    def assert_no_repeats(self, origin):
+        repeats = [p for p, n in Counter(origin.served).items() if n > 1]
+        self.assertEqual(repeats, [], "the same segment was fetched twice")
+
+    def test_new_token_does_not_repeat_video(self):
+        o, url = self.origin(), None
+        o.token = 1
+        playing = self.start(o.url)
+        t, res = self.background_play(playing, 12)
+        time.sleep(4)
+        o.token = 2
+        time.sleep(4)
+        o.token = 3
+        t.join()
+        self.assertIsNone(res[0]["failed"], res[0])
+        self.assert_no_repeats(o)
+        self.assertFalse(self.session().line.uri_mode)
+
+    def test_going_back_to_the_redirector_for_the_same_stream_does_not_repeat_video(self):
+        o = self.origin()
+        o.destinations = ["/live.m3u8"]
+        o.token = 1
+        playing = self.start(o.base + "/redirect.m3u8")
+        t, res = self.background_play(playing, 16)
+        time.sleep(6)
+        o.token = 2
+        self.session().line.media_url = o.base + "/gone.m3u8"  # the pinned address's token ran out
+        t.join()
+        self.assertEqual(res[0]["discontinuities"], 0, res[0])
+        self.assertIsNone(res[0]["failed"], res[0])
+        self.assert_no_repeats(o)
+
+    def test_going_back_to_the_redirector_for_a_new_stream_marks_the_join(self):
+        line = gw.Line("http://x/a.m3u8")
+        line.last_seq = 5000
+        line.relocated = True
+        pl = gw.Playlist("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:6,\na.ts\n#EXTINF:6,\nb.ts\n", "http://x/l.m3u8")
+        new, restarted = line.new_segments(pl)
+        self.assertTrue(restarted)
+        self.assertEqual([s[2] for s in new], ["http://x/b.ts"])
+
+    def test_segment_identity_ignores_tokens_only(self):
+        self.assertEqual(gw.segment_id("http://x/a/s1.ts?t=1&k=2"), gw.segment_id("http://x/a/s1.ts?t=9&k=8"))
+        self.assertNotEqual(gw.segment_id("http://x/seg.php?id=1"), gw.segment_id("http://x/seg.php?id=2"))
+
+
+class Racing(Harness):
+    def test_a_line_slower_than_real_time_at_tune_in_is_left_at_once(self):
+        slow, good = self.origin(), self.origin()
+        slow.throttle = 1.6
+        url = self.start(slow.url, good.url)
+        self.gateway.health.note(slow.url, True, rt=4.0)  # ranked first, on a record it no longer lives up to
+        self.gateway.health.note(good.url, True)
+        saved = gw.RACE_WIDTH
+        gw.RACE_WIDTH = 1
+        self.addCleanup(setattr, gw, "RACE_WIDTH", saved)
+        t, res = self.background_play(url, 8)
+        time.sleep(5)
+        self.assertEqual(self.session().line.url, good.url)
+        t.join()
+
+    def test_a_slow_start_is_kept_when_no_healthy_line_is_left(self):
+        slow, dead = self.origin(), self.origin()
+        slow.throttle = 1.6
+        dead.dead = True
+        url = self.start(slow.url, dead.url)
+        self.gateway.health.note(dead.url, False, why="dead")
+        r = hlssim.simulate(url, 6)
+        s = self.session()
+        self.assertEqual(s.stats["switches"], 0, s.describe())
+        self.assertEqual(s.stats["slate_secs"], 0, s.describe())
+
+    def test_a_good_record_beats_a_slightly_faster_burst(self):
+        health = gw.Health(None)
+        health.note("proven", True, rt=4.0)
+        health.note("unknown", True)
+        cond = threading.Condition()
+        fast = gw.Racer("unknown", 0, None, health, cond, lambda: False)
+        steady = gw.Racer("proven", 0, None, health, cond, lambda: False)
+        now = time.monotonic()
+        fast.first_byte = steady.first_byte = now - 1
+        fast.seg.data = bytearray(1_200_000)
+        steady.seg.data = bytearray(1_000_000)
+        pick = max((fast, steady), key=lambda r: r.rate() * (0.5 + min(health.rt(r.url), 4.0) / 4))
+        self.assertIs(pick, steady)
+
+
+class Dashboard(Harness):
+    def api(self, url, path):
+        base = url.split("/live/")[0]
+        status, body, _ = hlssim.http_get(base + path)
+        self.assertEqual(status, 200, path)
+        return json.loads(body.decode("utf-8"))
+
+    def test_a_clean_viewing_is_recorded_without_any_stall(self):
+        o = self.origin()
+        url = self.start(o.url)
+        r = hlssim.simulate(url, 8)
+        self.assertEqual(r["stalls"], 0, r)
+        now = self.api(url, "/api/now")
+        self.assertEqual(len(now["sessions"]), 1)
+        self.assertLess(now["sessions"][0]["viewer_stall_secs"], 1.0)  # a lower bound: never invents a stall
+        self.session().stop()
+        kinds = [e["kind"] for e in self.gateway.events.read()]
+        self.assertIn("tune", kinds)
+        self.assertIn("session", kinds)
+        day = self.api(url, "/api/history?days=3")["days"][-1]
+        self.assertEqual(day["tunes"], 1)
+        self.assertEqual(day["switches"], 0)
+
+    def test_a_stall_the_player_suffers_is_counted(self):
+        o = self.origin()
+        url = self.start(o.url)
+        hlssim.simulate(url, 3)
+        s = self.session()
+        s.client_media = 0.5  # as if the player had kept asking but received almost no video
+        self.assertGreater(s.viewer_stall(), 1.5)
+        self.assertLessEqual(s.viewer_stall(), s.last_seen - s.client_t0)
+
+    def test_leaving_is_not_counted_as_a_stall(self):
+        o = self.origin()
+        url = self.start(o.url)
+        hlssim.simulate(url, 4)
+        time.sleep(6)  # the player has gone; the session lingers until it times out
+        s = self.session()
+        self.assertLess(s.viewer_stall(), 1.0)
+        s.stop()
+        session = next(e for e in self.gateway.events.read() if e["kind"] == "session")
+        self.assertLess(session["stall_secs"], 1.0)
+        self.assertLessEqual(session["secs"], 5)
+
+    def test_switches_and_reasons_reach_the_history(self):
+        a, b = self.origin(), self.origin()
+        url = self.start(a.url, b.url)
+        t, res = self.background_play(url, 12)
+        time.sleep(5)
+        victim, _ = self.in_use(a, b)
+        victim.dead = True
+        t.join()
+        h = self.api(url, "/api/history?days=2")
+        self.assertGreaterEqual(h["days"][-1]["switches"], 1)
+        switch = next(e for e in h["recent"] if e["kind"] == "switch")
+        self.assertEqual(switch["name"], "T1")
+        self.assertTrue(switch["why"])
+
+    def test_channel_table_and_refresh_history(self):
+        o = self.origin()
+        url = self.start(o.url)
+        refresh = Path(self.tmp.name) / "refresh.jsonl"
+        refresh.write_text(json.dumps({"t": int(time.time()), "minutes": 30, "channels_ok": 70, "failing": ["X"]}) + chr(10),
+                           encoding="utf-8")
+        rows = self.api(url, "/api/channels")
+        self.assertEqual([r["id"] for r in rows], ["T1"])
+        self.assertEqual(rows[0]["lines"], 1)
+        self.assertEqual(self.api(url, "/api/history")["refreshes"][-1]["channels_ok"], 70)
+        self.assertEqual(self.api(url, "/api/now")["last_refresh"]["minutes"], 30)
+
+    def test_dashboard_page_is_served(self):
+        url = self.start(self.origin().url)
+        status, body, _ = hlssim.http_get(url.split("/live/")[0] + "/dash")
+        self.assertEqual(status, 200)
+        self.assertIn("电视网关面板".encode("utf-8"), body)
+
+    def test_old_events_are_pruned(self):
+        events = gw.Events(Path(self.tmp.name) / "e.jsonl")
+        events.add("tune", channel="A")
+        old = {"t": int(time.time()) - 40 * 86400, "kind": "tune", "channel": "B"}
+        with open(events.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(old) + chr(10))
+        events.prune()
+        self.assertEqual([e["channel"] for e in events.read()], ["A"])
+
+
 class Decoys(unittest.TestCase):
+    def test_tests_share_a_limit_per_server(self):
+        self.assertIs(build.host_slot("http://a.example/1.m3u8"), build.host_slot("http://a.example:80/2.m3u8"))
+        self.assertIsNot(build.host_slot("http://a.example/1.m3u8"), build.host_slot("http://b.example/1.m3u8"))
+
     def test_a_stream_many_channels_lead_to_is_a_decoy(self):
         found = build.find_decoys({"http://1.2.3.4:88/x/ad.m3u8": {"CCTV1", "CCTV2", "湖南卫视"}})
         self.assertIn("/x/ad.m3u8", found)

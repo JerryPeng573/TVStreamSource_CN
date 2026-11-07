@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1a1d">
+<title>电视网关面板</title>
+<style>
+  /* Layout: what is playing now first, then today, then the trend, then every channel. */
+  :root {
+    --bg: #f2f5f5; --panel: #ffffff; --sunk: #e8eeee; --fg: #142024; --muted: #59696d; --faint: #d5dfe0;
+    --series: #2a78d6; --good: #1d7a3e; --warn: #9a5a00; --bad: #b3362a;
+    --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1a1d; --panel: #172327; --sunk: #1f2d31; --fg: #e3ebec; --muted: #9aaeb2; --faint: #2e3f43;
+      --series: #3987e5; --good: #4cc274; --warn: #e0a640; --bad: #f07d6c; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1a1d; --panel: #172327; --sunk: #1f2d31; --fg: #e3ebec; --muted: #9aaeb2; --faint: #2e3f43;
+    --series: #3987e5; --good: #4cc274; --warn: #e0a640; --bad: #f07d6c; color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.6 var(--sans); }
+  main {
+    max-width: 1180px; margin: 0 auto; display: grid; gap: 22px; padding-block: 20px 40px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 16px; }
+  h1 { font-size: 22px; margin: 0; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  .muted { color: var(--muted); }
+  .num { font-variant-numeric: tabular-nums; }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .pill { display: inline-flex; align-items: center; gap: 5px; padding: 1px 9px; border-radius: 999px; font-size: 12.5px;
+          border: 1px solid currentColor; white-space: nowrap; }
+  .pill::before { font-size: 11px; }
+  .good { color: var(--good); } .good.pill::before { content: "●"; }
+  .warn { color: var(--warn); } .warn.pill::before { content: "▲"; }
+  .bad { color: var(--bad); } .bad.pill::before { content: "■"; }
+  section.panel { background: var(--panel); border: 1px solid var(--faint); border-radius: 8px; padding: 16px; min-width: 0; }
+  .row { display: grid; gap: 22px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .row > * { min-width: 0; }
+
+  .sessions { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+  .session { background: var(--sunk); border-radius: 6px; padding: 12px; display: grid; gap: 6px; min-width: 0; }
+  .session b { font-size: 16px; }
+  .meter { height: 8px; border-radius: 4px; background: var(--faint); overflow: hidden; }
+  .meter > i { display: block; height: 100%; background: var(--series); border-radius: 4px; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; }
+  .kv dt { color: var(--muted); } .kv dd { margin: 0; overflow-wrap: anywhere; }
+
+  .tiles { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+  .tile { display: grid; gap: 2px; }
+  .tile .v { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.2; }
+  .tile .l { color: var(--muted); font-size: 12.5px; }
+
+  .chart { position: relative; }
+  .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .chart .axis { fill: var(--muted); font-size: 11px; }
+  .chart .grid { stroke: var(--faint); stroke-width: 1; }
+  .chart .bar { fill: var(--series); }
+  .chart .bar.dim { opacity: .35; }
+  .chart .hit { fill: transparent; cursor: default; }
+  .chart .hit:hover + .bar, .chart .hit:focus + .bar { opacity: .8; }
+  .tip { position: absolute; pointer-events: none; background: var(--fg); color: var(--bg); padding: 4px 8px; border-radius: 4px;
+         font-size: 12px; white-space: nowrap; transform: translate(-50%, -110%); }
+  details { margin-top: 6px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+
+  .tablewrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 10px 6px 0; border-bottom: 1px solid var(--faint); vertical-align: top; white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--panel); }
+  th button { all: unset; cursor: pointer; } th button:focus-visible { outline: 2px solid var(--series); }
+  td.num, th.num { text-align: right; padding-right: 14px; }
+  .tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+  input, select { font: inherit; color: var(--fg); background: var(--sunk); border: 1px solid var(--faint); border-radius: 6px; padding: 4px 8px; }
+  input:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid var(--series); outline-offset: 1px; }
+  a { color: var(--series); }
+  ul.events { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; max-height: 360px; overflow: auto; }
+  ul.events li { display: grid; grid-template-columns: 92px 1fr; gap: 10px; }
+  .empty { color: var(--muted); padding: 8px 0; }
+  .error { color: var(--bad); }
+  @media (prefers-reduced-motion: no-preference) { .meter > i { transition: width .6s ease; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>电视网关面板</h1>
+    <div><span id="online" class="pill warn">连接中</span> <span id="updated" class="muted"></span></div>
+  </header>
+
+  <section class="panel" aria-labelledby="h-now">
+    <h2 id="h-now">现在在播放</h2>
+    <div id="sessions" class="sessions"><div class="empty">正在读取…</div></div>
+  </section>
+
+  <section class="panel" aria-labelledby="h-today">
+    <h2 id="h-today">今天</h2>
+    <div id="today" class="tiles"></div>
+  </section>
+
+  <div class="row">
+    <section class="panel" aria-labelledby="h-switch">
+      <h2 id="h-switch">每天自动换线次数</h2>
+      <div class="chart" id="c-switch"></div>
+      <details><summary>查看数据表</summary><div class="tablewrap" id="t-switch"></div></details>
+    </section>
+    <section class="panel" aria-labelledby="h-stall">
+      <h2 id="h-stall">每天电视端卡顿（估计，秒）</h2>
+      <div class="chart" id="c-stall"></div>
+      <details><summary>查看数据表</summary><div class="tablewrap" id="t-stall"></div></details>
+    </section>
+    <section class="panel" aria-labelledby="h-refresh">
+      <h2 id="h-refresh">每晚刷新后有线路的频道数</h2>
+      <div class="chart" id="c-refresh"></div>
+      <details><summary>查看数据表</summary><div class="tablewrap" id="t-refresh"></div></details>
+    </section>
+  </div>
+
+  <section class="panel" aria-labelledby="h-channels">
+    <h2 id="h-channels">频道</h2>
+    <div class="tools">
+      <label for="q" class="muted">搜索</label><input id="q" type="search" placeholder="频道名">
+      <label for="flt" class="muted">显示</label>
+      <select id="flt">
+        <option value="all">全部</option>
+        <option value="issue">需要关注</option>
+        <option value="央视">央视</option><option value="卫视">卫视</option><option value="港澳台">港澳台</option><option value="其他">其他</option>
+      </select>
+      <span id="ch-count" class="muted"></span>
+    </div>
+    <div class="tablewrap" id="channels"></div>
+  </section>
+
+  <div class="row">
+    <section class="panel" aria-labelledby="h-events">
+      <h2 id="h-events">最近事件</h2>
+      <ul class="events" id="events"><li class="empty">正在读取…</li></ul>
+    </section>
+    <section class="panel" aria-labelledby="h-sys">
+      <h2 id="h-sys">XPS 和线路库</h2>
+      <dl class="kv" id="system"></dl>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const host = u => { try { return new URL(u).host; } catch (e) { return u || ""; } };
+const ago = t => {
+  if (!t) return "—";
+  const s = Math.max(0, Date.now() / 1000 - t);
+  if (s < 90) return "刚刚";
+  if (s < 5400) return Math.round(s / 60) + " 分钟前";
+  if (s < 129600) return Math.round(s / 3600) + " 小时前";
+  return Math.round(s / 86400) + " 天前";
+};
+const clock = t => new Date(t * 1000).toLocaleString("zh-CN", {month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit"});
+const dur = s => s < 60 ? Math.round(s) + " 秒" : s < 3600 ? Math.round(s / 60) + " 分钟" : (s / 3600).toFixed(1) + " 小时";
+const WHY = {"slow start": "起播太慢", "slow": "速度太慢", "deadline": "下载超时", "stale playlist": "内容停止更新",
+  "switched by hand": "手动换线", "advert stream": "跳到广告", "segment is not MPEG-TS": "内容不是视频"};
+const why = w => { if (!w) return ""; for (const k in WHY) if (w.startsWith(k)) return WHY[k]; return w.replace(/^connect: |^read: /, "连接失败 "); };
+
+async function get(path) {
+  const r = await fetch(path, {cache: "no-store"});
+  if (!r.ok) throw new Error(path + " " + r.status);
+  return r.json();
+}
+
+function renderNow(d) {
+  const box = $("sessions");
+  if (!d.sessions.length) { box.innerHTML = '<div class="empty">现在没有设备在看。</div>'; return; }
+  box.innerHTML = d.sessions.map(s => {
+    const cushion = s.cushion_secs || 0;
+    const state = !s.line ? ["bad", "正在找线路"] : cushion < 8 ? ["warn", "缓冲偏少"] : ["good", "正常"];
+    return `<div class="session">
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><b>${esc(s.channel)}</b><span class="pill ${state[0]}">${state[1]}</span></div>
+      <div class="meter" role="img" aria-label="缓冲 ${cushion} 秒"><i style="width:${Math.min(100, cushion / 40 * 100)}%"></i></div>
+      <dl class="kv">
+        <dt>缓冲</dt><dd class="num">${cushion} 秒</dd>
+        <dt>线路</dt><dd class="mono">${esc(host(s.line)) || "—"}</dd>
+        <dt>速度</dt><dd class="num">${s.rt ? s.rt + " 倍实时" : "—"}</dd>
+        <dt>已看</dt><dd class="num">${dur(s.age_secs)}</dd>
+        <dt>换线</dt><dd class="num">${s.switches} 次</dd>
+        <dt>估计卡顿</dt><dd class="num">${s.viewer_stall_secs ?? 0} 秒</dd>
+        ${s.slate_secs ? `<dt>无信号</dt><dd class="num">${s.slate_secs} 秒</dd>` : ""}
+      </dl></div>`;
+  }).join("");
+}
+
+function renderToday(h) {
+  const t = h.days[h.days.length - 1] || {};
+  const tiles = [["换台", t.tunes], ["自动换线", t.switches], ["估计卡顿", (t.stall_secs || 0) + " 秒"],
+                 ["无信号画面", (t.slate_secs || 0) + " 秒"], ["找不到线路", t.no_line], ["观看", (t.watch_min || 0) + " 分钟"]];
+  $("today").innerHTML = tiles.map(([l, v]) => `<div class="tile"><span class="v">${v ?? 0}</span><span class="l">${l}</span></div>`).join("");
+}
+
+function barChart(el, tableEl, rows, value, label, fmt, whole) {
+  const W = 560, H = 200, L = 40, R = 8, T = 10, B = 26;
+  const vals = rows.map(value);
+  const max = Math.max(1, ...vals);
+  const step = whole ? Math.max(1, Math.round(niceStep(max))) : niceStep(max);
+  const top = Math.ceil(max / step) * step;
+  const y = v => T + (H - T - B) * (1 - v / top);
+  const bw = (W - L - R) / rows.length;
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(el.dataset.title || "")}">`;
+  for (let v = 0; v <= top + 1e-9; v += step) {
+    s += `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text class="axis num" x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${+v.toFixed(1)}</text>`;
+  }
+  const every = Math.ceil(rows.length / 7);
+  rows.forEach((r, i) => {
+    const x = L + i * bw, w = Math.max(2, bw - 2), v = vals[i], top_ = y(v), h = Math.max(0, H - B - top_);
+    const r4 = Math.min(4, w / 2, h);
+    const path = h > 0 ? `M${x + 1} ${H - B}V${top_ + r4}Q${x + 1} ${top_} ${x + 1 + r4} ${top_}H${x + 1 + w - r4}Q${x + 1 + w} ${top_} ${x + 1 + w} ${top_ + r4}V${H - B}Z` : "";
+    s += `<rect class="hit" x="${x}" y="${T}" width="${bw}" height="${H - T - B}" tabindex="0" data-i="${i}"/>`;
+    s += path ? `<path class="bar" d="${path}"/>` : `<path class="bar"/>`;
+    if (i % every === 0 || i === rows.length - 1) s += `<text class="axis" x="${x + bw / 2}" y="${H - 8}" text-anchor="middle">${label(r)}</text>`;
+  });
+  s += `</svg><div class="tip" hidden></div>`;
+  if (vals.every(v => !v)) s += `<p class="muted" style="margin:4px 0 0">这段时间没有记录。事件从 2026 年 11 月 8 日开始记录。</p>`;
+  el.innerHTML = s;
+  const tip = el.querySelector(".tip"), svg = el.querySelector("svg");
+  const show = e => {
+    const i = +e.target.dataset.i;
+    const box = svg.getBoundingClientRect(), hit = e.target.getBoundingClientRect(), host = el.getBoundingClientRect();
+    tip.textContent = `${label(rows[i], true)}：${fmt(vals[i])}`;
+    tip.style.left = (hit.left - host.left + hit.width / 2) + "px";
+    tip.style.top = (y(vals[i]) / H * box.height) + "px";
+    tip.hidden = false;
+  };
+  el.querySelectorAll(".hit").forEach(h => { h.addEventListener("mouseenter", show); h.addEventListener("focus", show);
+    h.addEventListener("mouseleave", () => tip.hidden = true); h.addEventListener("blur", () => tip.hidden = true); });
+  tableEl.innerHTML = `<table><thead><tr><th>日期</th><th class="num">数值</th></tr></thead><tbody>${
+    rows.map((r, i) => `<tr><td>${label(r, true)}</td><td class="num">${fmt(vals[i])}</td></tr>`).join("")}</tbody></table>`;
+}
+function niceStep(max) {
+  const raw = max / 4, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const n = raw / mag;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * mag;
+}
+const dayLabel = (r, full) => full ? r.day : r.day.slice(5).replace("-", "/");
+
+function renderHistory(h) {
+  renderToday(h);
+  barChart($("c-switch"), $("t-switch"), h.days, r => r.switches, dayLabel, v => v + " 次", true);
+  barChart($("c-stall"), $("t-stall"), h.days, r => r.stall_secs, dayLabel, v => v + " 秒");
+  const runs = h.refreshes.slice(-14);
+  if (runs.length) {
+    barChart($("c-refresh"), $("t-refresh"), runs, r => r.channels_ok,
+      (r, full) => { const d = new Date(r.t * 1000); return full ? d.toLocaleDateString("zh-CN") : (d.getMonth() + 1) + "/" + d.getDate(); },
+      v => v + " 个频道", true);
+  } else {
+    $("c-refresh").innerHTML = '<div class="empty">还没有刷新记录。下一次凌晨刷新后出现。</div>';
+    $("t-refresh").innerHTML = "";
+  }
+  const ev = $("events");
+  if (!h.recent.length) { ev.innerHTML = '<li class="empty">这段时间没有需要注意的事件。</li>'; return; }
+  ev.innerHTML = h.recent.map(e => {
+    let text;
+    if (e.kind === "switch") text = `<span class="pill warn">换线</span> ${esc(e.name)}：${esc(why(e.why))}，当时缓冲 ${e.cushion ?? "?"} 秒`;
+    else if (e.kind === "no_line") text = `<span class="pill bad">无线路</span> ${esc(e.name)}：所有线路都没响应`;
+    else text = `<span class="pill warn">卡顿</span> ${esc(e.name)}：看了 ${dur(e.secs)}，估计卡 ${e.stall_secs} 秒${e.slate_secs ? `，无信号 ${e.slate_secs} 秒` : ""}`;
+    return `<li><span class="muted num">${clock(e.t)}</span><span>${text}</span></li>`;
+  }).join("");
+}
+
+let channelRows = [], sortKey = "issue";
+function channelState(c) {
+  if (c.failing_since) return ["warn", "上次刷新未通过"];
+  if (!c.healthy) return ["bad", "线路都不健康"];
+  if (c.networks === 1) return ["warn", "只有一个网络"];
+  if (c.last_trouble && Date.now() / 1000 - c.last_trouble < 86400) return ["warn", "最近出过问题"];
+  return ["good", "正常"];
+}
+function renderChannels() {
+  const q = $("q").value.trim().toLowerCase(), f = $("flt").value;
+  const rank = {bad: 0, warn: 1, good: 2};
+  let rows = channelRows.map(c => ({...c, state: channelState(c)}))
+    .filter(c => (!q || c.name.toLowerCase().includes(q) || c.id.toLowerCase().includes(q)) &&
+      (f === "all" || (f === "issue" ? c.state[0] !== "good" : c.group === f)));
+  const by = {issue: (a, b) => rank[a.state[0]] - rank[b.state[0]] || a.healthy - b.healthy,
+              name: (a, b) => a.name.localeCompare(b.name, "zh"), healthy: (a, b) => a.healthy - b.healthy,
+              trouble: (a, b) => (b.last_trouble || 0) - (a.last_trouble || 0)};
+  rows.sort(by[sortKey]);
+  $("ch-count").textContent = `${rows.length} 个频道`;
+  $("channels").innerHTML = `<table><thead><tr>
+    <th><button data-k="name">频道</button></th><th>分组</th><th><button data-k="issue">状态</button></th>
+    <th class="num"><button data-k="healthy">健康线路</button></th><th class="num">网络</th><th><button data-k="trouble">最近问题</button></th><th></th>
+  </tr></thead><tbody>${rows.map(c => `<tr>
+    <td>${esc(c.name)}</td><td class="muted">${esc(c.group)}</td><td><span class="pill ${c.state[0]}">${c.state[1]}</span></td>
+    <td class="num">${c.healthy} / ${c.lines}</td><td class="num">${c.networks ?? "—"}</td><td class="muted">${ago(c.last_trouble)}</td>
+    <td><a href="/?ch=${encodeURIComponent(c.id)}">网页播放</a></td></tr>`).join("")}</tbody></table>`;
+  $("channels").querySelectorAll("th button").forEach(b => b.onclick = () => { sortKey = b.dataset.k; renderChannels(); });
+}
+
+function renderSystem(d) {
+  const w = d.wifi, r = d.last_refresh;
+  const items = [
+    ["网关运行", dur(d.uptime_secs)], ["内存", d.memory_mb != null ? d.memory_mb + " MB" : "—"],
+    ["Wi-Fi", w ? `${esc(w.SSID || "")} · ${esc(w.freq || "")} MHz · ${esc(w.signal || "")}` : "—"],
+    ["Wi-Fi 速率", w ? esc(w.rx_bitrate || "—").split(" MBit")[0] + " Mbps 下行" : "—"],
+    ["线路", `${d.lines_healthy} 条健康 / 共 ${d.lines} 条，${d.channels} 个频道`],
+    ["线路库生成", d.lines_generated ? esc(d.lines_generated) : "—"],
+    ["上次刷新", r ? `${clock(r.t)}，用时 ${r.minutes} 分钟，${r.channels_ok} 个频道有线路，${r.failing.length} 个没有` : "还没有记录"],
+  ];
+  $("system").innerHTML = items.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+}
+
+async function tickNow() {
+  try {
+    const d = await get("/api/now");
+    renderNow(d); renderSystem(d);
+    $("online").className = "pill good"; $("online").textContent = "网关在线";
+    $("updated").textContent = "更新于 " + new Date().toLocaleTimeString("zh-CN");
+  } catch (e) {
+    $("online").className = "pill bad"; $("online").textContent = "连不上网关";
+  }
+}
+async function tickSlow() {
+  try { renderHistory(await get("/api/history?days=14")); } catch (e) { $("events").innerHTML = '<li class="error">读取历史失败，稍后自动重试。</li>'; }
+  try { channelRows = await get("/api/channels"); renderChannels(); } catch (e) { $("channels").innerHTML = '<div class="error">读取频道失败，稍后自动重试。</div>'; }
+}
+$("q").addEventListener("input", renderChannels);
+$("flt").addEventListener("change", renderChannels);
+tickNow(); tickSlow();
+setInterval(tickNow, 5000);
+setInterval(tickSlow, 60000);
+</script>
+</body>
+</html>
